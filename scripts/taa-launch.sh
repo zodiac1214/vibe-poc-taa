@@ -41,7 +41,9 @@ sig="$(codesign -dv "$bundle" 2>&1 || true)"
 if grep -q 'flags=.*runtime' <<<"$sig"; then
   ents="$(codesign -d --entitlements - --xml "$bundle" 2>/dev/null || true)"
   missing=()
-  grep -q 'com.apple.security.cs.allow-dyld-environment-variables' <<<"$ents" || missing+=(allow-dyld-environment-variables)
+  # get-task-allow (debuggable build) also lets dyld honour DYLD_* variables, e.g. X-Plane 12.
+  grep -qE 'com.apple.security.cs.allow-dyld-environment-variables|com.apple.security.get-task-allow' <<<"$ents" \
+    || missing+=(allow-dyld-environment-variables)
   grep -q 'com.apple.security.cs.disable-library-validation' <<<"$ents" || missing+=(disable-library-validation)
   if [[ ${#missing[@]} -gt 0 ]]; then
     echo "[taa-launch] WARNING: hardened runtime without: ${missing[*]}" >&2

@@ -51,9 +51,12 @@ and the injector reconstructs native or 4K output at the end of the frame.
   hooks that find the engine's depth and motion textures and its jitter. That's
   out of scope.
 - **UI is upscaled too.** The whole final frame is processed, HUD included.
-- **Direct `[drawable present]`** (e.g. from a scheduled handler) is handled on
-  the injector's own queue. Ordering against the game's GPU work is best
-  effort. A warning is printed once when this path is used.
+- **Direct `[drawable present]`** (X-Plane does this) is submitted on the queue
+  the game rendered with, which the render-encoder hook records, so GPU order
+  is kept. With several frames in flight the upscaled image can be one frame
+  newer than the drawable it lands on. If no game queue is known, it falls
+  back to the last queue anything was committed on, then to the injector's own
+  queue.
 - **Hardened runtime.** Most shipped apps ignore `DYLD_INSERT_LIBRARIES` or
   reject ad-hoc signed dylibs. `scripts/resign-copy.sh` ad-hoc re-signs a
   **copy** with the needed entitlements, which carries all the risks in the
@@ -86,6 +89,27 @@ scripts/resign-copy.sh /Applications/Some.app ~/taa-apps/Some.app
 TAA_OUTPUT=4k scripts/taa-launch.sh ~/taa-apps/Some.app
 ```
 
+### X-Plane 12 on an ultrawide (5120×1440)
+
+Tested only at the main menu with X-Plane 12.4.4-r2 on an M2 Max. X-Plane is
+built with `get-task-allow`, so it can be injected **without re-signing**.
+X-Plane renders the full scene at the reduced size and MetalFX brings it back
+to native.
+
+```sh
+TAA_RENDER_SCALE=0.67 scripts/taa-launch.sh "$HOME/X-Plane 12/X-Plane.app"
+```
+
+- Leave `TAA_OUTPUT=native`. 5120×1440 is about 7.4 MP, fewer pixels than 4K,
+  and `4k` would force a 16:9 image onto a 32:9 screen.
+- In X-Plane, set **Rendering Resolution (FSR) = Off** so it doesn't upscale
+  twice, and run full screen on the ultrawide.
+- X-Plane ignores SIGTERM. Quit it from its own menu.
+- The UI is rendered at the reduced size too, so text gets softer. Mouse
+  mapping at reduced scale was **not tested**.
+- X-Plane's built-in FSR is the supported way to do this. This injector exists
+  only to study MetalFX and the TAA-lite pass.
+
 ### Settings (environment variables)
 
 | Variable | Default | Meaning |
@@ -100,6 +124,7 @@ TAA_OUTPUT=4k scripts/taa-launch.sh ~/taa-apps/Some.app
 | `TAA_LOG` | `0` | Log sizes, hooks and resources to stderr. |
 | `TAA_DUMP_FRAME` | – | Write the input and output of frame N as PNGs. |
 | `TAA_DUMP_PREFIX` | `/tmp/taa_dump` | Path prefix for the dumps. |
+| `TAA_INHERIT` | `0` | `1` passes the injector on to child processes. By default it's removed so browser helpers and crash reporters aren't injected. |
 
 ## Layout
 

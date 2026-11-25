@@ -238,6 +238,7 @@ static NSString *sz(CGSize s) { return [NSString stringWithFormat:@"%.0fx%.0f", 
     id<MTLDevice> builtDevice;
     long frame;
     BOOL warnedDirect;
+    __weak id<MTLCommandQueue> gameQueue;  // queue the game renders into renderTex on
 }
 @end
 
@@ -278,7 +279,23 @@ static PresentFn orig_presentDrawable;
 static PresentTimeFn orig_presentDrawableAtTime;
 static PresentTimeFn orig_presentDrawableAfter;
 
+typedef id (*RenderEncFn)(id, SEL, MTLRenderPassDescriptor *);
+typedef void (*CommitFn)(id, SEL);
+static RenderEncFn orig_renderEncoder;
+static CommitFn orig_commit;
+
 static Class gProxyClass;
+static __weak id<MTLCommandQueue> gLastCommitQueue;
+
+// renderTex -> owning layer state (weak, so in-flight textures never keep state alive).
+@interface TAAWeakBox : NSObject {
+  @public
+    __weak id obj;
+}
+@end
+@implementation TAAWeakBox
+@end
+static char kTexOwnerKey;
 
 #pragma mark - Size bookkeeping
 
@@ -388,6 +405,11 @@ static BOOL prepareResources(TAALayerState *st, CAMetalLayer *layer) {
     if (!isSRGB(fmt)) ru |= MTLTextureUsageShaderWrite;  // some engines write the backbuffer from compute
     if (st->scaler && !gCfg.temporal) ru |= scalerColorUsage;
     st->renderTex = makeTex(dev, fmt, r, ru, @"taa-render (game backbuffer)");
+    if (st->renderTex) {
+        TAAWeakBox *box = [TAAWeakBox new];
+        box->obj = st;
+        objc_setAssociatedObject(st->renderTex, &kTexOwnerKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
 
     if (gCfg.temporal) {
         MTLTextureUsage hu = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | scalerColorUsage;
@@ -542,18 +564,23 @@ static BOOL encodeResolve(TAALayerState *st, id<CAMetalDrawable> real, id<MTLCom
 }
 
 // Direct -present (e.g. from a scheduled handler). We have no access to the game's
-// command buffer here, so we submit on our own queue. Cross-queue ordering with the
-// game's rendering is NOT guaranteed — best effort only.
+// command buffer here, so we submit a new one on the queue the game rendered into our
+// texture with (seen via the render-encoder hook), which keeps GPU ordering. Fallbacks:
+// the last queue anything was committed on, then our own queue (ordering not guaranteed).
 - (void)presentWith:(void (^)(id<MTLCommandBuffer> cb))presentBlock {
     if (encoded) {
         [real present];
         return;
     }
+    id<MTLCommandQueue> q = state->gameQueue;
+    NSString *which = @"game's render queue";
+    if (!q) { q = gLastCommitQueue; which = @"last committed queue (ordering likely but not guaranteed)"; }
+    if (!q) { q = state->gpu->queue; which = @"own queue (ordering NOT guaranteed)"; }
     if (!state->warnedDirect) {
         state->warnedDirect = YES;
-        TAAWarn(@"game calls -[CAMetalDrawable present] directly; using own queue (ordering is best effort)");
+        TAALog(@"game calls -[CAMetalDrawable present] directly; submitting on %@", which);
     }
-    id<MTLCommandBuffer> cb = [state->gpu->queue commandBuffer];
+    id<MTLCommandBuffer> cb = [q commandBuffer];
     [self resolveInto:cb];
     presentBlock(cb);
     [cb commit];
@@ -621,6 +648,25 @@ static void hk_presentDrawableAfter(id self, SEL _cmd, id d, CFTimeInterval t) {
     orig_presentDrawableAfter(self, _cmd, d, t);
 }
 
+static id hk_renderEncoder(id self, SEL _cmd, MTLRenderPassDescriptor *rp) {
+    for (NSUInteger i = 0; i < 4; i++) {
+        id<MTLTexture> t = rp.colorAttachments[i].texture;
+        if (!t) continue;
+        TAAWeakBox *box = objc_getAssociatedObject(t, &kTexOwnerKey);
+        TAALayerState *st = box ? box->obj : nil;
+        if (st) {
+            st->gameQueue = [(id<MTLCommandBuffer>)self commandQueue];
+            break;
+        }
+    }
+    return orig_renderEncoder(self, _cmd, rp);
+}
+
+static void hk_commit(id self, SEL _cmd) {
+    gLastCommitQueue = [(id<MTLCommandBuffer>)self commandQueue];
+    orig_commit(self, _cmd);
+}
+
 static IMP swap(Class cls, SEL sel, IMP replacement) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) {
@@ -644,7 +690,11 @@ static BOOL installCommandBufferHooks(id<MTLDevice> dev) {
             (PresentTimeFn)swap(cls, @selector(presentDrawable:atTime:), (IMP)hk_presentDrawableAtTime);
         orig_presentDrawableAfter =
             (PresentTimeFn)swap(cls, @selector(presentDrawable:afterMinimumDuration:), (IMP)hk_presentDrawableAfter);
-        ok = orig_presentDrawable && orig_presentDrawableAtTime && orig_presentDrawableAfter;
+        orig_renderEncoder =
+            (RenderEncFn)swap(cls, @selector(renderCommandEncoderWithDescriptor:), (IMP)hk_renderEncoder);
+        orig_commit = (CommitFn)swap(cls, @selector(commit), (IMP)hk_commit);
+        ok = orig_presentDrawable && orig_presentDrawableAtTime && orig_presentDrawableAfter && orig_renderEncoder &&
+             orig_commit;
         TAALog(@"command buffer class %s hooked: %@", class_getName(cls), ok ? @"yes" : @"NO");
     });
     return ok;
@@ -674,6 +724,8 @@ __attribute__((constructor)) static void taa_inject_init(void) {
                         "upscale=%d output=%s render_scale=%.2f\n",
                 gCfg.enabled, gCfg.temporal, gCfg.upscale,
                 gCfg.outputNative ? "native" : sz(gCfg.outputSize).UTF8String, gCfg.renderScale);
+        // Don't leak into child processes (browser helpers, crash reporters, relaunchers...).
+        if (!envBool("TAA_INHERIT", NO)) unsetenv("DYLD_INSERT_LIBRARIES");
         if (!gCfg.enabled) return;
         gProxyClass = [TAAProxyDrawable class];
         Class layer = [CAMetalLayer class];
